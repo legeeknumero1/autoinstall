@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+#### Variables à personnaliser ####
+HOSTNAME="archlinux"
+USERNAME="louka"
+ROOT_PART_SIZE=""          # Laisser vide pour tout le disque après EFI
+EFI_SIZE="513MiB"
+KERNEL_PKG="linux-cachyos-bore"
+KERNEL_HEADERS_PKG="linux-cachyos-bore-headers"
+SWAP_SIZE="8G"             # Taille du swap Btrfs
+##################################
+
+# 1. Détection du disque
+DISK=$(lsblk -dpno NAME | grep -E "/dev/(nvme[0-9]n[0-9]|sd[a-z]|vd[a-z]|mmcblk[0-9])$" | head -n1)
+if [[ -z "$DISK" ]]; then
+  echo "Erreur : aucun disque compatible trouvé." >&2
+  exit 1
+fi
+EFI_PART="${DISK}p1"
+ROOT_PART="${DISK}p2"
+
+# 2. Nettoyage et partitionnement
+wipefs -af "$DISK"
+sgdisk --zap-all "$DISK"
+
+parted -s "$DISK" \
+  mklabel gpt \
+  mkpart ESP fat32 1MiB $EFI_SIZE \
+  set 1 esp on \
+  mkpart primary btrfs $EFI_SIZE 100%
+
+# 3. Formatage des partitions
+mkfs.fat -F32 -n EFI "$EFI_PART"
+mkfs.btrfs -f -L ROOT "$ROOT_PART"
+
+# 4. Montage et création des subvolumes Btrfs
+mount "$ROOT_PART" /mnt
+for sub in @ @home @var @opt @tmp @log @cache @pkg @snapshots; do
+  btrfs subvolume create /mnt/$sub
+done
+umount /mnt
+
+mount -o noatime,ssd,compress=zstd,space_cache=v2,subvol=@ "$ROOT_PART" /mnt
+mkdir -p /mnt/{boot/efi,home,var,opt,tmp,var/log,var/cache/pacman/pkg,.snapshots}
+
+mount -o noatime,ssd,compress=zstd,space_cache=v2,subvol=@home "$ROOT_PART" /mnt/home
+mount -o noatime,ssd,compress=zstd,space_cache=v2,subvol=@var  "$ROOT_PART" /mnt/var
+mount -o noatime,ssd,compress=zstd,space_cache=v2,subvol=@opt  "$ROOT_PART" /mnt/opt
+mount -o noatime,ssd,compress=zstd,space_cache=v2,subvol=@tmp  "$ROOT_PART" /mnt/tmp
+mount -o noatime,ssd,compress=zstd,space_cache=v2,subvol=@log  "$ROOT_PART" /mnt/var/log
+mount -o noatime,ssd,compress=zstd,space_cache=v2,subvol=@cache "$ROOT_PART" /mnt/var/cache
+mount -o noatime,ssd,compress=zstd,space_cache=v2,subvol=@pkg  "$ROOT_PART" /mnt/var/cache/pacman/pkg
+mount -o noatime,ssd,compress=zstd,space_cache=v2,subvol=@snapshots "$ROOT_PART" /mnt/.snapshots
+
+mount "$EFI_PART" /mnt/boot/efi
+
+# 5. Installation des paquets de base
+pacman -Sy --noconfirm \
+  base base-devel \
+  grub efibootmgr os-prober \
+  networkmanager \
+  reflector \
+  btrfs-progs snapper grub-btrfs \
+  pipewire pipewire-alsa pipewire-pulse wireplumber \
+  $KERNEL_PKG $KERNEL_HEADERS_PKG intel-ucode amd-ucode \
+  nvidia nvidia-utils \
+  sudo nano
+
+# 6. Configuration dans le chroot
+arch-chroot /mnt /bin/bash <<'EOF'
+set -euo pipefail
+
+# Fuseau horaire
+ln -sf /usr/share/zoneinfo/Europe/Paris /etc/localtime
+hwclock --systohc
+
+# Locales
+sed -i 's/^#fr_FR.UTF-8 UTF-8/fr_FR.UTF-8 UTF-8/' /etc/locale.gen
+locale-gen
+echo LANG=fr_FR.UTF-8 > /etc/locale.conf
+echo KEYMAP=fr > /etc/vconsole.conf
+
+# Hostname et hosts
+echo "$HOSTNAME" > /etc/hostname
+cat > /etc/hosts <<_EOF
+127.0.0.1   localhost
+::1         localhost
+127.0.1.1   ${HOSTNAME}.localdomain ${HOSTNAME}
+_EOF
+
+# Génération du fstab
+genfstab -U -p /mnt >> /mnt/etc/fstab
+
+# Ajustement fstab pour Btrfs subvolumes et swapfile
+sed -i '/subvol=.snapshots/d' /mnt/etc/fstab
+
+# Swapfile Btrfs
+mkdir -p /mnt/swap
+btrfs property set /mnt/swap compression none
+truncate -s ${SWAP_SIZE} /mnt/swap/swapfile
+chmod 600 /mnt/swap/swapfile
+mkswap /mnt/swap/swapfile
+echo '/swap/swapfile none swap defaults 0 0' >> /mnt/etc/fstab
+
+# GRUB
+sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="quiet splash rootflags=subvol=@"/' /etc/default/grub
+grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB
+grub-mkconfig -o /boot/grub/grub.cfg
+
+# Comptes utilisateurs
+echo "Merci de définir le mot de passe root :"
+passwd root
+
+useradd -m -G wheel,uucp,video,audio,optical,storage $USERNAME
+echo "Merci de définir le mot de passe pour $USERNAME :"
+passwd $USERNAME
+
+# Sudo
+sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
+
+# Services
+systemctl enable NetworkManager
+systemctl enable fstrim.timer
+systemctl enable reflector.timer
+systemctl enable snapper-*.timer
+EOF
+
+# 7. Nettoyage final
+umount -R /mnt
+echo -e "\n\033[1;32mInstallation terminée avec succès!\033[0m"
+echo "Tu peux maintenant redémarrer (Login: $USERNAME)."
